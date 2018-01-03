@@ -38,6 +38,7 @@ type SignalHandler struct {
 func NewSignalHandler() *SignalHandler {
 	return &SignalHandler{
 		done:      make(chan struct{}),
+		stop:      make(chan struct{}),
 		preHooks:  make(map[os.Signal][]SignalHook),
 		postHooks: make(map[os.Signal][]SignalHook),
 	}

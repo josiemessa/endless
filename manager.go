@@ -157,19 +157,22 @@ func (m *Manager) Restart() (*os.Process, error) {
 	cmd.Stdin = os.Stdin
 	cmd.Env = env
 
-	pr, pw, err := os.Pipe()
+	pipeRead, pipeWrite, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("restart failed: %v", err)
 	}
-	cmd.ExtraFiles = append([]*os.File{pw}, files...)
+	cmd.ExtraFiles = append([]*os.File{pipeWrite}, files...)
 
 	if err := cmd.Start(); err != nil {
-		pr.Close()
-		pw.Close()
+		pipeWrite.Close()
+		pipeRead.Close()
 		return nil, fmt.Errorf("restart failed: %v", err)
 	}
 
-	go m.childWait(pr)
+	// Close our copy of the write side straight away so we don't hold it open
+	// after the child closes it
+	pipeWrite.Close()
+	go m.childWait(pipeRead)
 
 	return cmd.Process, nil
 }
@@ -179,12 +182,10 @@ func (m *Manager) Restart() (*os.Process, error) {
 func (m *Manager) childWait(rc io.ReadCloser) error {
 	for {
 		buf := make([]byte, 10)
-		n, err := rc.Read(buf)
+		_, err := rc.Read(buf)
 		if err != nil {
-			fmt.Println("read1:", err)
 			break
 		}
-		fmt.Println("read2:", buf[:n])
 	}
 
 	return m.Shutdown()
@@ -249,4 +250,5 @@ func Terminate(d time.Duration) error {
 // SetHandler calls SetHandler on the default manager.
 func SetHandler(h Handler) {
 	mgr.SetHandler(h)
+	go h.Handle(mgr)
 }
