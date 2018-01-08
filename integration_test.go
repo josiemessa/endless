@@ -247,6 +247,7 @@ func waitForServer(uri string) error {
 // * the PID on start up
 // * request received notification from the HTTP handler
 func watchStdout(outPipe io.ReadCloser, messages chan string) {
+	defer close(messages)
 	scanner := bufio.NewScanner(outPipe)
 	for scanner.Scan() {
 		line := scanner.Text()
