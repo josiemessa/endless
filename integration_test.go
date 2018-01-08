@@ -1,11 +1,14 @@
 package endless
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -20,9 +23,11 @@ import (
 )
 
 const (
-	integrationServerFeatureToggle = "GO_INTEGRATION_TEST_SERVER"
-	integrationServerPort          = "4242"
-	integrationServerPath          = "/test"
+	intSrvFeatureToggle = "GO_INTEGRATION_TEST_SERVER"
+	intSrvPort          = "4242"
+	intSrvPath          = "/test"
+	intSrvAlivePath     = "/alive"
+	intSrvReqRecv       = "request received"
 )
 
 var (
@@ -33,16 +38,18 @@ var (
 // test server binary so that we can test signal handling and the subsequent
 // shutdown/restarts from a separate binary from the test itself.
 // This test is only run when an environment variable feature toggle
-// (named by integrationServerFeatureToggle) is set by the calling test
+// (named by intSrvFeatureToggle) is set by the calling test
 func TestIntegrationServer(t *testing.T) {
-	if os.Getenv(integrationServerFeatureToggle) != "1" {
+	if os.Getenv(intSrvFeatureToggle) != "1" {
 		t.Skip("Skipping as have not been asked to stand up integration server")
 	}
 	mux1 := mux.NewRouter()
 
-	mux1.HandleFunc(integrationServerPath, integrationTestServerHandler).Methods("GET")
+	mux1.HandleFunc(intSrvPath, integrationTestServerHandler).Methods("GET")
+	alive := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }
+	mux1.HandleFunc(intSrvAlivePath, alive).Methods("GET")
 
-	srv := NewServer("tcp", "localhost:"+integrationServerPort, mux1)
+	srv := NewServer("tcp", "localhost:"+intSrvPort, mux1)
 	srv.ErrorLog = log.New(os.Stdout, "", log.LstdFlags)
 	srv.Debug = true
 	srv.TerminateTimeout = 5 * time.Second
@@ -55,8 +62,9 @@ func TestIntegrationServer(t *testing.T) {
 	fmt.Println("Shutting down")
 }
 
-// handler used by the integration test server
+// integrationTestServerHandler is the handler used by the integration test server
 func integrationTestServerHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println(intSrvReqRecv)
 	duration, err := time.ParseDuration(r.FormValue("duration"))
 	if err != nil {
 		http.Error(w, err.Error(), 400)
@@ -77,109 +85,83 @@ func createIntegrationServerTest() *exec.Cmd {
 	cmd := exec.Command(os.Args[0], "-test.run=TestIntegrationServer")
 
 	// Set the feature toggle for the integration test server
-	cmd.Env = []string{integrationServerFeatureToggle + "=1"}
+	cmd.Env = []string{intSrvFeatureToggle + "=1"}
 
 	return cmd
 }
 
 func TestIntegrationRestart(t *testing.T) {
 	intServer := createIntegrationServerTest()
-	serverMessages := make(chan string)
+	msgs := make(chan string)
 	// Start test integration server
-	require.NoError(t, startIntegrationServer(intServer, serverMessages), "starting integration test server")
-	parentPid := intServer.Process.Pid
-	defer teardownServer(parentPid)
+	require.NoError(t, startIntegrationServer(intServer, msgs), "starting integration test server")
+	ppid := intServer.Process.Pid
+	defer teardownServer(ppid)
 	go intServer.Wait()
 
 	// The pid is printed out from the integation test server once it has fully started up
 	// Check for this message so we can start sending requests/signals to the server
-	serverStartTimeout := time.NewTimer(3 * time.Second)
-	select {
-	case <-serverStartTimeout.C:
-		t.Fatal("Server did not start up in time")
-	case msg, msgChannelOpen := <-serverMessages:
-		require.True(t, msgChannelOpen, "Unexpected close of server messages channel")
-		msgPid, _ := strconv.Atoi(msg) // don't care about error here as we're just going to compare msgPid to the parentpid anyway
-		require.Equal(t, parentPid, msgPid, "Unexpected message down server messages channel")
-	}
+	msg, err := waitForMessage(msgs, 3*time.Second)
+	require.NoError(t, err, "wait for server startup")
+	msgPid, _ := strconv.Atoi(msg) // don't care about error here as we're just going to compare msgPid to the parentpid anyway
+	require.Equal(t, ppid, msgPid, "Unexpected message down messages channel")
 
-	time.Sleep(50 * time.Millisecond) // quick sleep just to give the server a chance to bind to port
+	// Wait for the server to actually come up and respond to requests before we send any important ones
+	require.NoError(t, waitForServer(fmt.Sprintf("http://localhost:%s%s", intSrvPort, intSrvAlivePath)), "wait for server to accept requests")
 
 	// Send a long running request to the test server
-	longReqWait := &sync.WaitGroup{}
-	longReqWait.Add(1)
+	lReqWait := &sync.WaitGroup{}
+	lReqWait.Add(1)
 	var (
-		longResp     *http.Response
-		longReqError error
+		lResp   *http.Response
+		lReqErr error
 	)
 	go func() {
-		longResp, longReqError = sendIntegrationTestRequest(2 * time.Second)
-		longReqWait.Done()
+		lResp, lReqErr = sendIntegrationTestRequest(2 * time.Second)
+		lReqWait.Done()
 	}()
 
-	time.Sleep(50 * time.Millisecond) // quick sleep just to give the request a chance to get handled
+	msg, err = waitForMessage(msgs, 1*time.Second)
+	require.NoError(t, err, "wait for long request to arrive")
+	require.Equal(t, intSrvReqRecv, msg, "unexpected message while waiting for long request to arrive")
 
 	// Send a signal to the test server to restart
-	require.NoError(t, intServer.Process.Signal(syscall.SIGHUP), "send signal to restart integration test server")
+	require.NoError(t, intServer.Process.Signal(syscall.SIGHUP), "send signal to restart")
 
 	// The child server should also print it's pid out once it's started up, so look for this
-	var childPid int
-	childStartTimeout := time.NewTimer(3 * time.Second)
-	select {
-	case <-childStartTimeout.C:
-		t.Fatal("Child server did not start up in time")
-	case msg, msgChannelOpen := <-serverMessages:
-		require.True(t, msgChannelOpen, "Unexpected close of server messages channel")
-		msgPid, _ := strconv.Atoi(msg) // don't care about error here as we're just going to check msgPid isn't zero
-		require.NotZero(t, msgPid, "Unexpected message down server messages channel")
-		childPid = msgPid
-	}
-	defer teardownServer(childPid) // set up the child server to be torn down on test exit
+	msg, err = waitForMessage(msgs, 3*time.Second)
+	require.NoError(t, err, "wait for child server startup")
+	cpid, _ := strconv.Atoi(msg) // don't care about error here as we're just going to check msgPid isn't zero
+	require.NotZero(t, msgPid, "Unexpected message down messages channel")
+	defer teardownServer(cpid) // set up the child server to be torn down on test exit
 
-	quickResp, quickReqError := sendIntegrationTestRequest(0 * time.Second)
-	require.NoError(t, quickReqError, "sending quick request to child integration test server")
-	require.Equal(t,
-		http.StatusOK,
-		quickResp.StatusCode,
-		"http response code from long running request")
+	// Send a quick request to the server. The child server should now be up and running, accepting requests,
+	// so check that it is the child PID that appears in the response and not the parent
+	qResp, qReqErr := sendIntegrationTestRequest(0 * time.Second)
+	require.NoError(t, qReqErr, "sending quick request to child server")
+	require.Equal(t, http.StatusOK, qResp.StatusCode, "response code from long request")
 
-	quickRespBody, err := ioutil.ReadAll(quickResp.Body)
-	quickResp.Body.Close()
+	qBody, err := ioutil.ReadAll(qResp.Body)
+	qResp.Body.Close()
 	require.NoError(t, err, "read from quick request body")
-	require.NotContains(t,
-		string(quickRespBody),
-		fmt.Sprintf("%d", parentPid),
-		"response from quick request contained PID from parent integration test server instead of child")
-	require.Contains(t,
-		string(quickRespBody),
-		fmt.Sprintf("%d", childPid),
-		"response from quick request did not contain PID from child integration test server")
+	require.NotContains(t, string(qBody), fmt.Sprintf("%d", ppid), "quick response contained wrong PID")
+	require.Contains(t, string(qBody), fmt.Sprintf("%d", cpid), "quick response did not contain correct PID")
 
 	// Wait for long request to finish, which should be responded to from
 	// the parent integration test server
-	longReqWait.Wait()
-	require.NoError(t,
-		longReqError,
-		"sending long request to parent integration test server")
-	require.Equal(t,
-		http.StatusOK,
-		longResp.StatusCode,
-		"http response code from long running request")
-	longRespBody, err := ioutil.ReadAll(longResp.Body)
-	require.NoError(t,
-		err,
-		"read from long running request body")
-	require.Contains(t,
-		string(longRespBody),
-		fmt.Sprintf("%d", parentPid),
-		"response from long running request did not contain PID from parent integration test server")
+	lReqWait.Wait()
+	require.NoError(t, lReqErr, "sending long request to parent server")
+	require.Equal(t, http.StatusOK, lResp.StatusCode, "http response code from long running request")
+	lBody, err := ioutil.ReadAll(lResp.Body)
+	require.NoError(t, err, "read from long request body")
+	require.Contains(t, string(lBody), fmt.Sprintf("%d", ppid), "long response did not contain correct PID")
 	time.Sleep(5 * time.Second)
 	require.Error(t, intServer.Process.Signal(syscall.Signal(0)), "Expected error when signalling stopped parent process, process has not exited")
 
 }
 
 func sendIntegrationTestRequest(sleepDuration time.Duration) (*http.Response, error) {
-	reqURL := fmt.Sprintf("http://localhost:%s%s?duration=%s", integrationServerPort, integrationServerPath, sleepDuration)
+	reqURL := fmt.Sprintf("http://localhost:%s%s?duration=%s", intSrvPort, intSrvPath, sleepDuration)
 	timeout := int(sleepDuration.Seconds() + 2) // add two seconds to the duration of the call to get the http timeout
 
 	client := http.Client{
@@ -198,8 +180,7 @@ func startIntegrationServer(intServer *exec.Cmd, messages chan string) error {
 		close(messages)
 		return err
 	}
-	// Watch Stdout for IntegrationServerMagicWords message
-	// which is sent when server shutdown has started
+	// Forward relevant messages from stdout back to the test
 	go watchStdout(outPipe, messages)
 	return nil
 }
@@ -218,35 +199,65 @@ func teardownServer(pid int) {
 	}
 }
 
-// watchStdout watches stdout from the test integration server for specific messages
-//
-// * when a child server spins up, it prints out the message: "PID: <PID>", which we use
-//   to tear down the child server when the test finishes
-func watchStdout(outPipe io.ReadCloser, messages chan string) {
-	buffer := make([]byte, 1024)
-	var currentline []byte
-	for {
-		n, err := outPipe.Read(buffer)
-		if err == io.EOF {
-			fmt.Println("stdout pipe closed")
-			close(messages)
-			return
+func waitForMessage(msgs chan string, timeout time.Duration) (string, error) {
+	to := time.NewTimer(timeout)
+	select {
+	case <-to.C:
+		return "", fmt.Errorf("timeout exceeded")
+	case msg, open := <-msgs:
+		if !open {
+			return "", fmt.Errorf("unexpected close of messages channel")
 		}
-		// As we read from the stdout pipe, there's no guarantee we'll get
-		// new lines in separate reads, so keep track of what we've read already
-		// and only pass in one line at a time to be checked
-		for _, char := range buffer[0:n] {
-			if string(char) == "\n" {
-				linestring := string(currentline)
-				fmt.Println(linestring)
-				currentline = []byte{}
-				if pid, ok := checkforpid(linestring); ok {
-					messages <- pid
-					break
-				}
-			} else {
-				currentline = append(currentline, char)
+		return msg, nil
+	}
+}
+
+func waitForServer(uri string) error {
+	reqURL, err := url.ParseRequestURI(uri)
+	if err != nil {
+		return err
+	}
+	client := http.Client{
+		Timeout: 5 * time.Millisecond,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	for {
+		cctx, ccancel := context.WithTimeout(ctx, 10*time.Millisecond)
+		defer ccancel()
+		req := &http.Request{
+			URL: reqURL,
+		}
+		req.WithContext(cctx)
+		resp, err := client.Do(req)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-cctx.Done():
+			return cctx.Err()
+		default:
+			if err == nil && resp.StatusCode == http.StatusOK {
+				return nil
 			}
+		}
+	}
+}
+
+// watchStdout watches stdout from the test integration server for specific messages
+// * the PID on start up
+// * request received notification from the HTTP handler
+func watchStdout(outPipe io.ReadCloser, messages chan string) {
+	scanner := bufio.NewScanner(outPipe)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fmt.Println(line)
+		if pid, ok := checkforpid(line); ok {
+			messages <- pid
+			continue
+		}
+		if line == intSrvReqRecv {
+			messages <- line
+			continue
 		}
 
 	}
