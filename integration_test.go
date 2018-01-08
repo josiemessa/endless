@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,9 +20,9 @@ import (
 )
 
 const (
-	IntegrationServerFeatureToggle = "GO_INTEGRATION_TEST_SERVER"
-	IntegrationServerPort          = "4242"
-	IntegrationServerPath          = "/test"
+	integrationServerFeatureToggle = "GO_INTEGRATION_TEST_SERVER"
+	integrationServerPort          = "4242"
+	integrationServerPath          = "/test"
 )
 
 var (
@@ -32,26 +33,26 @@ var (
 // test server binary so that we can test signal handling and the subsequent
 // shutdown/restarts from a separate binary from the test itself.
 // This test is only run when an environment variable feature toggle
-// (named by IntegrationServerFeatureToggle) is set by the calling test
+// (named by integrationServerFeatureToggle) is set by the calling test
 func TestIntegrationServer(t *testing.T) {
-	if os.Getenv(IntegrationServerFeatureToggle) != "1" {
-		t.Skip("Skipping as do not need to stand up integration test server in this run")
+	if os.Getenv(integrationServerFeatureToggle) != "1" {
+		t.Skip("Skipping as have not been asked to stand up integration server")
 	}
-
-	// Create new HTTP server
 	mux1 := mux.NewRouter()
 
-	mux1.HandleFunc(IntegrationServerPath, integrationTestServerHandler).
-		Methods("GET")
+	mux1.HandleFunc(integrationServerPath, integrationTestServerHandler).Methods("GET")
 
-	srv := NewServer("tcp", "localhost:"+IntegrationServerPort, mux1)
+	srv := NewServer("tcp", "localhost:"+integrationServerPort, mux1)
+	srv.ErrorLog = log.New(os.Stdout, "", log.LstdFlags)
 	srv.Debug = true
+	srv.TerminateTimeout = 5 * time.Second
 
 	// This is used to signal back to the calling test that the server has started up
 	fmt.Println("PID:", os.Getpid())
 	if err := srv.ListenAndServe(); err != nil {
 		fmt.Println(err)
 	}
+	fmt.Println("Shutting down")
 }
 
 // handler used by the integration test server
@@ -76,27 +77,32 @@ func createIntegrationServerTest() *exec.Cmd {
 	cmd := exec.Command(os.Args[0], "-test.run=TestIntegrationServer")
 
 	// Set the feature toggle for the integration test server
-	cmd.Env = []string{IntegrationServerFeatureToggle + "=1"}
+	cmd.Env = []string{integrationServerFeatureToggle + "=1"}
 
 	return cmd
 }
 
 func TestIntegrationRestart(t *testing.T) {
-
 	intServer := createIntegrationServerTest()
-	serverMessages := make(chan string) // channel to receive notifications from the integration server
+	serverMessages := make(chan string)
 	// Start test integration server
 	require.NoError(t, startIntegrationServer(intServer, serverMessages), "starting integration test server")
 	parentPid := intServer.Process.Pid
 	defer teardownServer(parentPid)
-	go intServer.Wait() // when this ends the parent process should be over and pipe clean up will happen
+	go intServer.Wait()
 
 	// The pid is printed out from the integation test server once it has fully started up
 	// Check for this message so we can start sending requests/signals to the server
-	msg, msgChannelOpen := <-serverMessages
-	require.True(t, msgChannelOpen, "Unexpected close of server messages channel")
-	msgPid, _ := strconv.Atoi(msg)
-	require.Equal(t, parentPid, msgPid, "Unexpected message down server messages channel")
+	serverStartTimeout := time.NewTimer(3 * time.Second)
+	select {
+	case <-serverStartTimeout.C:
+		t.Fatal("Server did not start up in time")
+	case msg, msgChannelOpen := <-serverMessages:
+		require.True(t, msgChannelOpen, "Unexpected close of server messages channel")
+		msgPid, _ := strconv.Atoi(msg) // don't care about error here as we're just going to compare msgPid to the parentpid anyway
+		require.Equal(t, parentPid, msgPid, "Unexpected message down server messages channel")
+	}
+
 	time.Sleep(50 * time.Millisecond) // quick sleep just to give the server a chance to bind to port
 
 	// Send a long running request to the test server
@@ -117,11 +123,17 @@ func TestIntegrationRestart(t *testing.T) {
 	require.NoError(t, intServer.Process.Signal(syscall.SIGHUP), "send signal to restart integration test server")
 
 	// The child server should also print it's pid out once it's started up, so look for this
-	msg, msgChannelOpen = <-serverMessages
-	require.True(t, msgChannelOpen, "Unexpected close of server messages channel")
-	msgPid, _ = strconv.Atoi(msg)
-	require.NotZero(t, msgPid, "Unexpected message down server messages channel")
-	childPid := msgPid
+	var childPid int
+	childStartTimeout := time.NewTimer(3 * time.Second)
+	select {
+	case <-childStartTimeout.C:
+		t.Fatal("Child server did not start up in time")
+	case msg, msgChannelOpen := <-serverMessages:
+		require.True(t, msgChannelOpen, "Unexpected close of server messages channel")
+		msgPid, _ := strconv.Atoi(msg) // don't care about error here as we're just going to check msgPid isn't zero
+		require.NotZero(t, msgPid, "Unexpected message down server messages channel")
+		childPid = msgPid
+	}
 	defer teardownServer(childPid) // set up the child server to be torn down on test exit
 
 	quickResp, quickReqError := sendIntegrationTestRequest(0 * time.Second)
@@ -132,6 +144,7 @@ func TestIntegrationRestart(t *testing.T) {
 		"http response code from long running request")
 
 	quickRespBody, err := ioutil.ReadAll(quickResp.Body)
+	quickResp.Body.Close()
 	require.NoError(t, err, "read from quick request body")
 	require.NotContains(t,
 		string(quickRespBody),
@@ -160,10 +173,13 @@ func TestIntegrationRestart(t *testing.T) {
 		string(longRespBody),
 		fmt.Sprintf("%d", parentPid),
 		"response from long running request did not contain PID from parent integration test server")
+	time.Sleep(5 * time.Second)
+	require.Error(t, intServer.Process.Signal(syscall.Signal(0)), "Expected error when signalling stopped parent process, process has not exited")
+
 }
 
 func sendIntegrationTestRequest(sleepDuration time.Duration) (*http.Response, error) {
-	reqURL := fmt.Sprintf("http://localhost:%s%s?duration=%s", IntegrationServerPort, IntegrationServerPath, sleepDuration)
+	reqURL := fmt.Sprintf("http://localhost:%s%s?duration=%s", integrationServerPort, integrationServerPath, sleepDuration)
 	timeout := int(sleepDuration.Seconds() + 2) // add two seconds to the duration of the call to get the http timeout
 
 	client := http.Client{
@@ -180,7 +196,6 @@ func startIntegrationServer(intServer *exec.Cmd, messages chan string) error {
 	}
 	if err := intServer.Start(); err != nil {
 		close(messages)
-		teardownServer(intServer.Process.Pid)
 		return err
 	}
 	// Watch Stdout for IntegrationServerMagicWords message
@@ -209,6 +224,7 @@ func teardownServer(pid int) {
 //   to tear down the child server when the test finishes
 func watchStdout(outPipe io.ReadCloser, messages chan string) {
 	buffer := make([]byte, 1024)
+	var currentline []byte
 	for {
 		n, err := outPipe.Read(buffer)
 		if err == io.EOF {
@@ -216,16 +232,35 @@ func watchStdout(outPipe io.ReadCloser, messages chan string) {
 			close(messages)
 			return
 		}
-		buffer = buffer[0:n]
-		line := strings.TrimSpace(string(buffer))
-		fmt.Println(line)
-		if strings.HasPrefix(line, "PID: ") {
-			pid := strings.TrimPrefix(line, "PID: ")
-			_, err := strconv.Atoi(pid)
-			if err != nil {
-				continue
+		// As we read from the stdout pipe, there's no guarantee we'll get
+		// new lines in separate reads, so keep track of what we've read already
+		// and only pass in one line at a time to be checked
+		for _, char := range buffer[0:n] {
+			if string(char) == "\n" {
+				linestring := string(currentline)
+				fmt.Println(linestring)
+				currentline = []byte{}
+				if pid, ok := checkforpid(linestring); ok {
+					messages <- pid
+					break
+				}
+			} else {
+				currentline = append(currentline, char)
 			}
-			messages <- pid
 		}
+
 	}
+
+}
+
+func checkforpid(line string) (string, bool) {
+	if !strings.Contains(line, "PID: ") {
+		return "", false
+	}
+	pid := strings.TrimPrefix(strings.TrimSpace(line), "PID: ")
+	_, err := strconv.Atoi(pid)
+	if err != nil {
+		return "", false
+	}
+	return pid, true
 }
