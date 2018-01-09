@@ -217,9 +217,7 @@ func waitForServer(uri string) error {
 	if err != nil {
 		return err
 	}
-	client := http.Client{
-		Timeout: 5 * time.Millisecond,
-	}
+	client := http.DefaultClient
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	for {
@@ -228,16 +226,19 @@ func waitForServer(uri string) error {
 		req := &http.Request{
 			URL: reqURL,
 		}
-		req.WithContext(cctx)
+		req = req.WithContext(cctx)
 		resp, err := client.Do(req)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-cctx.Done():
-			return cctx.Err()
+			// request took too long, go round again
 		default:
-			if err == nil && resp.StatusCode == http.StatusOK {
-				return nil
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					return nil
+				}
+				return fmt.Errorf("Unexpected HTTP response from server: %v", resp.StatusCode)
 			}
 		}
 	}
