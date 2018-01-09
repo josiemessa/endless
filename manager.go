@@ -157,22 +157,22 @@ func (m *Manager) Restart() (*os.Process, error) {
 	cmd.Stdin = os.Stdin
 	cmd.Env = env
 
-	pipeRead, pipeWrite, err := os.Pipe()
+	pr, pw, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("restart failed: %v", err)
 	}
-	cmd.ExtraFiles = append([]*os.File{pipeWrite}, files...)
+	cmd.ExtraFiles = append([]*os.File{pw}, files...)
 
 	if err := cmd.Start(); err != nil {
-		pipeWrite.Close()
-		pipeRead.Close()
+		pw.Close()
+		pr.Close()
 		return nil, fmt.Errorf("restart failed: %v", err)
 	}
 
 	// Close our copy of the write side straight away so we don't hold it open
 	// after the child closes it
-	pipeWrite.Close()
-	go m.childWait(pipeRead)
+	pw.Close()
+	go m.childWait(pr)
 
 	return cmd.Process, nil
 }
