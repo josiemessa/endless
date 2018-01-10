@@ -3,6 +3,8 @@ package endless
 import (
 	"bufio"
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -32,6 +34,7 @@ const (
 
 var (
 	serverpids = make(map[int]struct{})
+	host       = *flag.String("host", "localhost", "address of useable host to pass into test server")
 )
 
 // TestIntegrationServer isn't a real test - instead it is used as a
@@ -45,19 +48,20 @@ func TestIntegrationServer(t *testing.T) {
 	}
 	mux1 := mux.NewRouter()
 
-	mux1.HandleFunc(intSrvPath, integrationTestServerHandler).Methods("GET")
+	mux1.HandleFunc(intSrvPath, integrationTestServerHandler).Methods(http.MethodGet)
 	alive := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }
-	mux1.HandleFunc(intSrvAlivePath, alive).Methods("GET")
+	mux1.HandleFunc(intSrvAlivePath, alive).Methods(http.MethodGet)
 
 	srv := NewServer("tcp", "localhost:"+intSrvPort, mux1)
 	srv.ErrorLog = log.New(os.Stdout, "", log.LstdFlags)
 	srv.Debug = true
-	srv.TerminateTimeout = 5 * time.Second
+	srv.TerminateTimeout = 2 * time.Second
 
 	// This is used to signal back to the calling test that the server has started up
 	fmt.Println("PID:", os.Getpid())
 	if err := srv.ListenAndServe(); err != nil {
 		fmt.Println(err)
+		os.Exit(1)
 	}
 	fmt.Println("Shutting down")
 }
@@ -91,12 +95,13 @@ func createIntegrationServerTest() *exec.Cmd {
 }
 
 func TestIntegrationRestart(t *testing.T) {
+	flag.Parse()
 	intServer := createIntegrationServerTest()
-	msgs := make(chan string)
+	msgs := make(chan string, 3) // we read off the channel three times so ensure we don't deadlock
 	// Start test integration server
 	require.NoError(t, startIntegrationServer(intServer, msgs), "starting integration test server")
 	ppid := intServer.Process.Pid
-	defer teardownServer(ppid)
+	defer teardownServer(t, ppid)
 	go intServer.Wait()
 
 	// The pid is printed out from the integation test server once it has fully started up
@@ -104,7 +109,7 @@ func TestIntegrationRestart(t *testing.T) {
 	msg, err := waitForMessage(msgs, 3*time.Second)
 	require.NoError(t, err, "wait for server startup")
 	msgPid, _ := strconv.Atoi(msg) // don't care about error here as we're just going to compare msgPid to the parentpid anyway
-	require.Equal(t, ppid, msgPid, "Unexpected message down messages channel")
+	require.Equal(t, ppid, msgPid, "unexpected message down messages channel")
 
 	// Wait for the server to actually come up and respond to requests before we send any important ones
 	require.NoError(t, waitForServer(fmt.Sprintf("http://localhost:%s%s", intSrvPort, intSrvAlivePath)), "wait for server to accept requests")
@@ -132,20 +137,20 @@ func TestIntegrationRestart(t *testing.T) {
 	msg, err = waitForMessage(msgs, 3*time.Second)
 	require.NoError(t, err, "wait for child server startup")
 	cpid, _ := strconv.Atoi(msg) // don't care about error here as we're just going to check msgPid isn't zero
-	require.NotZero(t, msgPid, "Unexpected message down messages channel")
-	defer teardownServer(cpid) // set up the child server to be torn down on test exit
+	require.NotZero(t, msgPid, "unexpected message down messages channel")
+	defer teardownServer(t, cpid) // set up the child server to be torn down on test exit
 
 	// Send a quick request to the server. The child server should now be up and running, accepting requests,
 	// so check that it is the child PID that appears in the response and not the parent
-	qResp, qReqErr := sendIntegrationTestRequest(0 * time.Second)
+	qResp, qReqErr := sendIntegrationTestRequest(0)
 	require.NoError(t, qReqErr, "sending quick request to child server")
 	require.Equal(t, http.StatusOK, qResp.StatusCode, "response code from long request")
 
 	qBody, err := ioutil.ReadAll(qResp.Body)
 	qResp.Body.Close()
 	require.NoError(t, err, "read from quick request body")
-	require.NotContains(t, string(qBody), fmt.Sprintf("%d", ppid), "quick response contained wrong PID")
-	require.Contains(t, string(qBody), fmt.Sprintf("%d", cpid), "quick response did not contain correct PID")
+	require.NotContains(t, string(qBody), strconv.Itoa(ppid), "quick response contained wrong PID")
+	require.Contains(t, string(qBody), strconv.Itoa(cpid), "quick response did not contain correct PID")
 
 	// Wait for long request to finish, which should be responded to from
 	// the parent integration test server
@@ -155,8 +160,8 @@ func TestIntegrationRestart(t *testing.T) {
 	lBody, err := ioutil.ReadAll(lResp.Body)
 	require.NoError(t, err, "read from long request body")
 	require.Contains(t, string(lBody), fmt.Sprintf("%d", ppid), "long response did not contain correct PID")
-	time.Sleep(5 * time.Second)
-	require.Error(t, intServer.Process.Signal(syscall.Signal(0)), "Expected error when signalling stopped parent process, process has not exited")
+	time.Sleep(2 * time.Second)
+	require.Error(t, intServer.Process.Signal(syscall.Signal(0)), "expected error when signalling stopped parent process, process has not exited")
 
 }
 
@@ -185,16 +190,14 @@ func startIntegrationServer(intServer *exec.Cmd, messages chan string) error {
 	return nil
 }
 
-func teardownServer(pid int) {
+func teardownServer(t *testing.T, pid int) {
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		fmt.Printf("Could not find process with PID %d to clean up\n", pid)
+		t.Fatalf("Could not find process with PID %v to clean up\n", pid)
 	}
 	if err := proc.Kill(); err != nil {
 		if !strings.Contains(err.Error(), "process already finished") {
-			fmt.Printf(
-				"Could not kill process with PID %d with err %v. Manual clean up may be required\n",
-				pid, err)
+			t.Fatalf("Could not find process with PID %v to clean up\n", pid)
 		}
 	}
 }
@@ -203,10 +206,10 @@ func waitForMessage(msgs chan string, timeout time.Duration) (string, error) {
 	to := time.NewTimer(timeout)
 	select {
 	case <-to.C:
-		return "", fmt.Errorf("timeout exceeded")
+		return "", errors.New("timeout exceeded")
 	case msg, open := <-msgs:
 		if !open {
-			return "", fmt.Errorf("unexpected close of messages channel")
+			return "", errors.New("unexpected close of messages channel")
 		}
 		return msg, nil
 	}
@@ -217,17 +220,16 @@ func waitForServer(uri string) error {
 	if err != nil {
 		return err
 	}
+	req := &http.Request{
+		URL: reqURL,
+	}
 	client := http.DefaultClient
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	for {
 		cctx, ccancel := context.WithTimeout(ctx, 10*time.Millisecond)
 		defer ccancel()
-		req := &http.Request{
-			URL: reqURL,
-		}
-		req = req.WithContext(cctx)
-		resp, err := client.Do(req)
+		resp, err := client.Do(req.WithContext(cctx))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -238,7 +240,7 @@ func waitForServer(uri string) error {
 				if resp.StatusCode == http.StatusOK {
 					return nil
 				}
-				return fmt.Errorf("Unexpected HTTP response from server: %v", resp.StatusCode)
+				return fmt.Errorf("unexpected HTTP response from server: %v", resp.StatusCode)
 			}
 		}
 	}
@@ -251,9 +253,12 @@ func watchStdout(outPipe io.ReadCloser, messages chan string) {
 	defer close(messages)
 	scanner := bufio.NewScanner(outPipe)
 	for scanner.Scan() {
+		if scanner.Err() != nil {
+			close(messages)
+			return
+		}
 		line := scanner.Text()
-		fmt.Println(line)
-		if pid, ok := checkforpid(line); ok {
+		if pid, ok := getpid(line); ok {
 			messages <- pid
 			continue
 		}
@@ -261,12 +266,10 @@ func watchStdout(outPipe io.ReadCloser, messages chan string) {
 			messages <- line
 			continue
 		}
-
 	}
-
 }
 
-func checkforpid(line string) (string, bool) {
+func getpid(line string) (string, bool) {
 	if !strings.Contains(line, "PID: ") {
 		return "", false
 	}

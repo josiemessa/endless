@@ -28,7 +28,6 @@ type SignalHook func(sig os.Signal) (cont bool)
 // Pre and post signal handles can also be registered for custom actions.
 type SignalHandler struct {
 	mtx       sync.Mutex
-	stop      chan struct{}
 	done      chan struct{}
 	preHooks  map[os.Signal][]SignalHook
 	postHooks map[os.Signal][]SignalHook
@@ -38,7 +37,6 @@ type SignalHandler struct {
 func NewSignalHandler() *SignalHandler {
 	return &SignalHandler{
 		done:      make(chan struct{}),
-		stop:      make(chan struct{}),
 		preHooks:  make(map[os.Signal][]SignalHook),
 		postHooks: make(map[os.Signal][]SignalHook),
 	}
@@ -48,15 +46,14 @@ func NewSignalHandler() *SignalHandler {
 func (s *SignalHandler) Stop() {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-
 	select {
-	case <-s.done:
-		// already closed
-		return
+	case _, ok := <-s.done:
+		if !ok {
+			return
+		}
 	default:
-		close(s.stop)
-		<-s.done
 	}
+	close(s.done)
 }
 
 // Handle listens for os.Signal's and calls any registered function hooks.
@@ -65,41 +62,44 @@ func (s *SignalHandler) Handle(m *Manager) {
 	signal.Notify(c)
 	defer func() {
 		signal.Stop(c)
-		close(s.done)
+		s.Stop()
 	}()
 
 	pid := syscall.Getpid()
-	for {
-		var sig os.Signal
-		select {
-		case sig = <-c:
-		case <-s.stop:
-		}
-
-		if !s.handleSignal(s.preHooks[sig], sig) {
-			continue
-		}
-
-		switch sig {
-		case syscall.SIGHUP:
-			m.Debugln("Received", sig, "restarting...")
-			if _, err := m.Restart(); err != nil {
-				m.Println("Fork err:", err)
-			}
-		case syscall.SIGUSR2:
-			m.Debugln("Received", sig, "terminating...")
-			if err := m.Terminate(0); err != nil {
-				m.Println(pid, err)
-			}
-		case syscall.SIGINT, syscall.SIGTERM:
-			m.Debugln("Received", sig, "shutting down...")
-			if err := m.Shutdown(); err != nil {
-				m.Println(pid, err)
-			}
-		}
-
-		s.handleSignal(s.postHooks[sig], sig)
+	var sig os.Signal
+	select {
+	case sig = <-c:
+	case <-s.done:
+		return
 	}
+
+	if !s.handleSignal(s.preHooks[sig], sig) {
+		return
+	}
+
+	switch sig {
+	case syscall.SIGHUP:
+		m.Debugln("Received", sig, "restarting...")
+		if _, err := m.Restart(); err != nil {
+			m.Println("Fork err:", err)
+		}
+	case syscall.SIGUSR2:
+		m.Debugln("Received", sig, "terminating...")
+		if err := m.Terminate(0); err != nil {
+			m.Println(pid, err)
+		}
+	case syscall.SIGINT, syscall.SIGTERM:
+		m.Debugln("Received", sig, "shutting down...")
+		if err := m.Shutdown(); err != nil {
+			m.Println(pid, err)
+		}
+	}
+
+	s.handleSignal(s.postHooks[sig], sig)
+	// If we've got this far then we're handling a signal that will cause a shutdown
+	// of this process, so return as we are no longer handling any more signals
+
+	return
 }
 
 // handleSignal calls all hooks for a signal.
